@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools==80.9.0", "wheel==0.45.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "swarm-scheduler-lab"
+version = "0.1.0"
+description = "Reproducible restricted dispatch-rule search with isolated and cooperative agents"
+requires-python = ">=3.12,<3.13"
+readme = "README.md"
+license = "MIT"
+dependencies = [
+  "job-shop-lib==1.7.2",
+  "ortools==9.12.4544",
+  "matplotlib==3.11.2",
+  "jsonschema==4.26.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==9.2.0"]
+
+[project.scripts]
+swarm-scheduler-lab = "swarm_scheduler_lab.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
