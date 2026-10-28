@@ -15,10 +15,18 @@ class InvalidSchedule(ValueError):
     """A proposed schedule failed independent validation."""
 
 
+# JobShopLib's own default for DispatchingRuleSolver, spelled out so a library
+# default change cannot silently change the "pruned" search space.
+_READY_FILTERS = {"none": None, "pruned": ("dominated_operations", "non_immediate_operations")}
+
+
 def dispatch(instance: Instance, policy: Policy) -> list[dict[str, int]]:
     """Run a deterministic serial schedule-generation scheme via JobShopLib.
 
-    Eligible operations are the next unscheduled operation of each job. Their
+    With ``candidate_filter="none"``, eligible operations are the next
+    unscheduled operation of each job. With ``"pruned"``, JobShopLib keeps only
+    non-dominated operations that can start at the earliest possible time, so
+    ``earliest_start`` is equal across eligible operations. Each operation's
     start is the maximum of job and machine availability. At every decision,
     each feature is divided by its maximum among eligible operations (or zero
     if its maximum is zero). Machine load includes all unscheduled operations
@@ -68,8 +76,10 @@ def dispatch(instance: Instance, policy: Policy) -> list[dict[str, int]]:
 
         return eligible[min(range(len(eligible)), key=rank)]
 
-    # No library pruning: earliest_start remains a searchable preference.
-    schedule = DispatchingRuleSolver(rule, ready_operations_filter=None)(library_instance)
+    # Without pruning, earliest_start remains a searchable preference.
+    schedule = DispatchingRuleSolver(
+        rule, ready_operations_filter=_READY_FILTERS[policy.candidate_filter]
+    )(library_instance)
     records = [
         {
             "job": scheduled.job_id,

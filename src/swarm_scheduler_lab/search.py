@@ -13,13 +13,16 @@ from contextlib import nullcontext
 from .backends import MockBackend, OpenAICompatibleBackend, make_prompt, parse_candidate
 from .budget import BudgetExceeded, BudgetLedger
 from .instances import Instance
-from .policy import Policy, initial_policies, random_policy
+from .policy import CANDIDATE_FILTERS, Policy, initial_policies, random_policy
 from .scheduling import dispatch, validate
 
 
+# pruned_* baselines always use JobShopLib's default candidate pruning, so a
+# textbook rule stays visible whatever search space the experiment configures.
 METHODS = (
     "single", "independent", "cooperative", "shortest_processing_time",
-    "most_work_remaining", "random_search",
+    "most_work_remaining", "pruned_shortest_processing_time",
+    "pruned_most_work_remaining", "random_search",
 )
 AGENT_METHODS = METHODS[:3]
 DIRECTIONS = (
@@ -40,11 +43,13 @@ def _evaluate_one(args: tuple[Instance, dict]) -> dict:
         return {"instance": instance.name, "valid": False, "error": type(error).__name__}
 
 
-def exchange_ring(islands: list[list[dict]], round_number: int) -> list[dict]:
+def exchange_ring(islands: list[list[dict]], round_number: int, interval: int = 2) -> list[dict]:
     """Simultaneous training-winner migration; never replaces local history."""
     if len(islands) != 3:
         raise ValueError("The ring requires exactly three islands")
-    if round_number <= 0 or round_number % 2:
+    if type(interval) is not int or interval < 1:
+        raise ValueError("exchange interval must be a positive integer")
+    if round_number <= 0 or round_number % interval:
         return []
     if any(not island for island in islands):
         return []
@@ -71,6 +76,7 @@ def run_search(
     max_evaluations: int = 15, cpu_workers: int = 1, model: str | None = None,
     base_url: str | None = None, api_key_env: str = "SWARM_API_KEY",
     request_timeout: float = 60, max_retries: int = 0,
+    candidate_filter: str = "none", exchange_interval: int = 2,
 ) -> dict:
     """Search using only training instances; holdout/reference data are absent.
 
@@ -93,12 +99,23 @@ def run_search(
         raise ValueError("max_evaluations must be a positive integer")
     if type(max_retries) is not int or max_retries < 0:
         raise ValueError("max_retries must be a non-negative integer")
+    if candidate_filter not in CANDIDATE_FILTERS:
+        raise ValueError(f"candidate_filter must be one of {', '.join(CANDIDATE_FILTERS)}")
+    if type(exchange_interval) is not int or exchange_interval < 1:
+        raise ValueError("exchange_interval must be a positive integer")
     ledger = BudgetLedger(max_calls, max_tokens, max_evaluations)
     started = time.perf_counter()
     cpu_started = time.process_time()
     children = resource.getrusage(resource.RUSAGE_CHILDREN)
     child_cpu_started = children.ru_utime + children.ru_stime
-    initial = initial_policies(seed)
+    initial = initial_policies(seed, candidate_filter)
+    pruned = initial_policies(seed, "pruned")
+    static_baselines = {
+        "shortest_processing_time": initial[0],
+        "most_work_remaining": initial[1],
+        "pruned_shortest_processing_time": pruned[0],
+        "pruned_most_work_remaining": pruned[1],
+    }
     history: list[dict] = []
     attempts: list[dict] = []
     islands: list[list[dict]] = [[] for _ in range(1 if method == "single" else 3)]
@@ -161,8 +178,8 @@ def run_search(
                 islands[island_index].append(row)
             return row
 
-        if method in {"shortest_processing_time", "most_work_remaining"}:
-            evaluate(initial[0 if method == "shortest_processing_time" else 1], None, "static_baseline")
+        if method in static_baselines:
+            evaluate(static_baselines[method], None, "static_baseline")
         else:
             # Identical initial three candidates consume three evaluations in all
             # adaptive methods and random search. No privileged single-mode seed.
@@ -176,7 +193,7 @@ def run_search(
 
             if method == "random_search":
                 while ledger.snapshot()["evaluations"] < max_evaluations:
-                    evaluate(random_policy(rng), None, "random")
+                    evaluate(random_policy(rng, candidate_filter), None, "random")
             elif method in AGENT_METHODS:
                 # Quotient/remainder split never gives an island an implicit
                 # extra retry budget. Defaults are exactly 12 / (3 * 4).
@@ -198,7 +215,7 @@ def run_search(
                             "one continuous agent: combine short-operation, remaining-work, and random-weight exploration"
                             if method == "single" else DIRECTIONS[island_index]
                         )
-                        prompt = make_prompt(local_history, direction)
+                        prompt = make_prompt(local_history, direction, candidate_filter)
                         # A UTF-8 byte upper-bound plus protocol overhead is much
                         # more conservative than a chars/4 token estimate. Real
                         # providers must honor max_tokens; overruns are flagged.
@@ -217,7 +234,7 @@ def run_search(
                             generation = None
                             try:
                                 generation = generators[island_index].generate(prompt, local_history, max_output_tokens)
-                                candidate = parse_candidate(generation.content)
+                                candidate = parse_candidate(generation.content, candidate_filter)
                             except Exception as error:
                                 ledger.finish_call(
                                     reservation,
@@ -253,8 +270,14 @@ def run_search(
                             break
                     if not round_attempted:
                         break
-                    if method == "cooperative" and not stop_all:
-                        exchanges.extend(exchange_ring(islands, round_index + 1))
+                    # A migrant arriving after the last generation round could
+                    # never influence a proposal, so it is not sent at all.
+                    later_round = (
+                        any(calls < quota for calls, quota in zip(island_calls, quotas))
+                        and ledger.snapshot()["evaluations"] < max_evaluations
+                    )
+                    if method == "cooperative" and not stop_all and later_round:
+                        exchanges.extend(exchange_ring(islands, round_index + 1, exchange_interval))
                     if stop_all:
                         break
 

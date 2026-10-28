@@ -16,13 +16,10 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .instances import make_datasets
-from .policy import Policy
+from .policy import CANDIDATE_FILTERS, Policy
 from .scheduling import InvalidSchedule, dispatch, validate
-from .search import run_search
+from .search import AGENT_METHODS, METHODS, run_search
 from .solver import solve_reference
-
-AGENT_METHODS = ("single", "independent", "cooperative")
-METHODS = (*AGENT_METHODS, "shortest_processing_time", "most_work_remaining", "random_search")
 
 
 @dataclass(frozen=True)
@@ -44,6 +41,8 @@ class ExperimentConfig:
     solver_time_limit: float = 2.0
     timeout: float = 60.0
     max_retries: int = 0
+    candidate_filter: str = "none"
+    exchange_interval: int = 2
     model: str | None = None
     base_url: str | None = None
     api_key_env: str = "SWARM_API_KEY"
@@ -58,11 +57,14 @@ class ExperimentConfig:
         if not self.seeds or len(set(self.seeds)) != len(self.seeds):
             raise ValueError("supply at least one unique random seed")
         for name in ("train_count", "test_count", "jobs", "machines", "duration_max", "max_tokens",
-                     "max_output_tokens", "max_evaluations", "workers"):
+                     "max_output_tokens", "max_evaluations", "workers", "exchange_interval"):
             if getattr(self, name) < 1:
                 raise ValueError(f"{name} must be positive")
-        if not 0 <= self.max_calls <= 12:
-            raise ValueError("max_calls must be between 0 and 12 per method")
+        # No fixed ceiling: max_calls and max_tokens are the explicit hard limits.
+        if self.max_calls < 0:
+            raise ValueError("max_calls must be nonnegative")
+        if self.candidate_filter not in CANDIDATE_FILTERS:
+            raise ValueError(f"candidate_filter must be one of {', '.join(CANDIDATE_FILTERS)}")
         if self.max_evaluations < 3:
             raise ValueError("max_evaluations must include the three shared initial policies")
         if self.max_retries < 0:
@@ -162,6 +164,8 @@ def run_experiment(config: ExperimentConfig) -> dict:
                 max_evaluations=config.max_evaluations, cpu_workers=config.workers,
                 model=config.model, base_url=config.base_url, api_key_env=config.api_key_env,
                 request_timeout=config.timeout, max_retries=config.max_retries,
+                candidate_filter=config.candidate_filter,
+                exchange_interval=config.exchange_interval,
             ))
         result["runs"].append({"seed": seed, "datasets": dataset_json, "methods": methods})
 

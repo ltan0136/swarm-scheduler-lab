@@ -91,6 +91,26 @@ def test_policy_and_dispatch_are_deterministic(tiny):
         assert validate(tiny, dispatch(tiny, policy))["valid"]
 
 
+def test_pruned_policies_match_jobshoplib_builtin_rules():
+    from job_shop_lib.dispatching.rules import DispatchingRuleSolver
+
+    data = make_datasets(2026, 4, 1)
+    spt, mwr, _ = initial_policies(0, "pruned")
+    for instance in data["train"] + data["benchmark"]:
+        for policy, rule in ((spt, "shortest_processing_time"), (mwr, "most_work_remaining")):
+            schedule = dispatch(instance, policy)
+            builtin = DispatchingRuleSolver(dispatching_rule=rule)(instance.to_job_shop_lib())
+            assert validate(instance, schedule)["makespan"] == builtin.makespan()
+
+
+def test_pruning_only_ranks_operations_that_can_start_now(tiny):
+    # Unpruned SPT may wait for a short operation; pruned dispatch only ranks operations that can start now.
+    assert validate(tiny, dispatch(tiny, Policy()))["makespan"] == 6
+    assert validate(tiny, dispatch(tiny, Policy(candidate_filter="pruned")))["makespan"] == 3
+    with pytest.raises(ValueError):
+        Policy(candidate_filter="dominated")
+
+
 def test_dataset_split_streams_and_serialization():
     first = make_datasets(42, 2, 2)
     assert first == make_datasets(42, 2, 2)

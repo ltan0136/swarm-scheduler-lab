@@ -61,13 +61,19 @@ def test_changed_holdout_size_cannot_change_search_outcomes():
     {"base_url": "https://user:password@example.org/v1"},
     {"base_url": "https://example.org/v1?key=secret"},
     {"solver_time_limit": float("nan")},
-    {"max_calls": 13},
+    {"max_calls": -1},
+    {"candidate_filter": "dominated"},
+    {"exchange_interval": 0},
     {"max_evaluations": 2},
     {"seeds": (7, 7)},
 ])
 def test_invalid_configuration_rejected(changes):
     with pytest.raises(ValueError):
         replace(ExperimentConfig(), **changes).validate()
+
+
+def test_call_budget_above_twelve_is_accepted():
+    ExperimentConfig(max_calls=36, max_evaluations=39).validate()
 
 
 def test_real_requires_explicit_credentials(monkeypatch):
@@ -98,7 +104,7 @@ def test_offline_smoke_entrypoint_produces_valid_raw_data_and_images(tmp_path):
     assert result["resources"]["generation_calls"] <= 18
     for run in result["runs"]:
         instances = {i["name"]: Instance.from_dict(i) for split in run["datasets"].values() for i in split}
-        assert len(run["methods"]) == 6
+        assert len(run["methods"]) == 8
         for method in run["methods"]:
             assert method["history"]
             for row in method["final"]:
