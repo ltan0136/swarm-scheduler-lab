@@ -37,9 +37,28 @@ def _number(value: Any) -> str:
     return str(value).replace("|", "\\|").replace("\n", " ")
 
 
+def _gap_to_lower_bound(finals: list[dict], references: dict) -> tuple[float | None, int]:
+    """Mean relative gap of valid makespans above each instance's CP-SAT lower bound.
+
+    The gap to a valid lower bound is an upper bound on the true optimality gap; it equals
+    the true gap on instances where CP-SAT proved optimality. Returns ``(None, 0)`` unless
+    every valid schedule has a positive lower bound, so a partial average is never reported.
+    """
+    gaps, proven = [], 0
+    for final in finals:
+        ref = references.get((final["split"], final["instance"]))
+        bound = ref.get("best_bound") if ref else None
+        if not isinstance(bound, (int, float)) or not math.isfinite(bound) or bound <= 0:
+            return None, 0
+        gaps.append((final["makespan"] - bound) / bound)
+        proven += ref.get("status") == "OPTIMAL" and ref.get("proven_optimal") is True
+    return (statistics.mean(gaps), proven) if gaps else (None, 0)
+
+
 def _summary_rows(result: dict) -> list[dict]:
     rows = []
     for run in result.get("runs", []):
+        references = {(r["split"], r["instance"]): r for r in run.get("references", [])}
         for method in run.get("methods", []):
             for split in ("train", "test", "benchmark"):
                 finals = [r for r in method.get("final", []) if r["split"] == split]
@@ -47,6 +66,7 @@ def _summary_rows(result: dict) -> list[dict]:
                     continue
                 valid = [r for r in finals if r.get("valid") and r.get("makespan") is not None]
                 spans = [r["makespan"] for r in valid]
+                gap, proven = _gap_to_lower_bound(valid, references)
                 resources = method.get("resources", {})
                 rows.append(
                     {
@@ -60,6 +80,8 @@ def _summary_rows(result: dict) -> list[dict]:
                         "best_makespan": min(spans) if spans else None,
                         "mean_makespan": statistics.mean(spans) if spans else None,
                         "worst_makespan": max(spans) if spans else None,
+                        "mean_gap_to_lower_bound": gap,
+                        "gap_bounds_proven_optimal": proven if gap is not None else None,
                         "calls": resources.get("calls"),
                         "failures": resources.get("failures"),
                         "evaluations": resources.get("evaluations"),
@@ -307,14 +329,26 @@ def _markdown(result: dict, rows: list[dict], has_tokens: bool, has_gantt: bool)
         "`best` is the smallest makespan among instances in that split, not a new "
         "cross-instance optimization target. Compare means only for the same data split and seed.",
         "",
-        "| Seed | Method | Split | Valid / total | Best | Mean | Worst |",
-        "| --- | --- | --- | --- | --- | --- | --- |",
+        "`Mean gap` is the mean of (makespan − lower bound) / lower bound over valid schedules, "
+        "using each instance's CP-SAT lower bound. It weights every instance equally, unlike the "
+        "mean makespan, and is an upper bound on the true optimality gap; it equals the true gap "
+        "when every bound is a CP-SAT optimality proof (`proven` = instances with a proof). "
+        "`unknown` means at least one valid schedule had no usable bound.",
+        "",
+        "| Seed | Method | Split | Valid / total | Best | Mean | Worst | Mean gap (proven) |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for row in rows:
+        gap = row["mean_gap_to_lower_bound"]
+        gap_text = (
+            f"{gap:.1%} ({row['gap_bounds_proven_optimal']}/{row['valid']})"
+            if gap is not None
+            else "unknown"
+        )
         lines.append(
             f"| {row['seed']} | {row['method']} | {row['split']} | {row['valid']} / "
             f"{row['total']} | {_number(row['best_makespan'])} | {_number(row['mean_makespan'])} "
-            f"| {_number(row['worst_makespan'])} |"
+            f"| {_number(row['worst_makespan'])} | {gap_text} |"
         )
     lines += [
         "",
@@ -459,7 +493,8 @@ def generate_report(result: dict, output_dir: Path | str) -> list[str]:
     rows = _summary_rows(result)
     summary_fields = [
         "seed", "backend", "method", "split", "valid", "total", "valid_rate",
-        "best_makespan", "mean_makespan", "worst_makespan", "calls", "failures",
+        "best_makespan", "mean_makespan", "worst_makespan", "mean_gap_to_lower_bound",
+        "gap_bounds_proven_optimal", "calls", "failures",
         "evaluations", "input_tokens", "output_tokens", "unknown_usage_calls", "wall_time",
         "cpu_time", "resources_json",
     ]

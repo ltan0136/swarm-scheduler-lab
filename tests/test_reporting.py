@@ -146,3 +146,39 @@ def test_real_token_chart_requires_provider_measurements_and_stale_chart_is_remo
     generate_report(result, tmp_path)
     assert not (tmp_path / "tokens.png").exists()
     assert "actual token consumption is unknown" in (tmp_path / "report.md").read_text()
+
+
+def test_gap_uses_lower_bound_and_counts_only_proven_bounds(tmp_path):
+    result = _result()
+    result["runs"][0]["references"].append(
+        {
+            "instance": "ft06",
+            "split": "benchmark",
+            "status": "OPTIMAL",
+            "objective": 55,
+            "best_bound": 55.0,
+            "proven_optimal": True,
+            "wall_time": 0.1,
+        }
+    )
+    generate_report(result, tmp_path)
+    with (tmp_path / "summary.csv").open() as file:
+        rows = {(r["method"], r["split"]): r for r in csv.DictReader(file)}
+    # FEASIBLE reference: gap is measured against the lower bound 10, not the incumbent 15.
+    assert float(rows[("single", "test")]["mean_gap_to_lower_bound"]) == 2.0
+    assert rows[("single", "test")]["gap_bounds_proven_optimal"] == "0"
+    assert float(rows[("single", "benchmark")]["mean_gap_to_lower_bound"]) == 0.0
+    assert rows[("single", "benchmark")]["gap_bounds_proven_optimal"] == "1"
+    # No valid schedule, so no gap rather than a misleading zero.
+    assert rows[("single", "train")]["mean_gap_to_lower_bound"] == ""
+    report = (tmp_path / "report.md").read_text()
+    assert "| 200.0% (0/1) |" in report
+    assert "| 0.0% (1/1) |" in report
+
+
+def test_gap_is_unknown_when_any_valid_schedule_lacks_a_bound(tmp_path):
+    generate_report(_result(), tmp_path)  # FT06 has no reference in this fixture
+    with (tmp_path / "summary.csv").open() as file:
+        rows = {(r["method"], r["split"]): r for r in csv.DictReader(file)}
+    assert rows[("cooperative", "benchmark")]["mean_gap_to_lower_bound"] == ""
+    assert rows[("cooperative", "benchmark")]["gap_bounds_proven_optimal"] == ""
