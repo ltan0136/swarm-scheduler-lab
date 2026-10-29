@@ -259,6 +259,16 @@ def _proof_label(final: dict, reference: dict | None) -> str:
 
 def _markdown(result: dict, rows: list[dict], has_tokens: bool, has_gantt: bool) -> str:
     mock = result["config"]["backend"] == "mock"
+    # Results saved before these options existed used the same fixed behavior.
+    candidate_filter = result["config"].get("candidate_filter", "none")
+    exchange_interval = result["config"].get("exchange_interval", 2)
+    exchange_rounds = sorted({
+        event["round"]
+        for run in result.get("runs", [])
+        for method in run.get("methods", [])
+        if method["method"] == "cooperative"
+        for event in method.get("exchanges", [])
+    })
     lines = [
         "# Swarm scheduling experiment report",
         "",
@@ -276,6 +286,14 @@ def _markdown(result: dict, rows: list[dict], has_tokens: bool, has_gantt: bool)
         "A candidate evaluation means running one policy across every training instance. "
         "Initial candidates consume this budget. Methods share the same initial candidates. "
         "Model call failures and retries consume the call budget. Baselines make no model calls.",
+        "",
+        f"Searched rule space candidate filter: `{candidate_filter}` "
+        + (
+            "(every job's next operation is ranked, even one that cannot start yet). "
+            if candidate_filter == "none"
+            else "(JobShopLib's default dominated + non-immediate pruning). "
+        )
+        + "The `pruned_*` baselines always use JobShopLib's default pruning.",
         "",
         "## Run configuration",
         "",
@@ -409,9 +427,12 @@ def _markdown(result: dict, rows: list[dict], has_tokens: bool, has_gantt: bool)
         "workflow check, not a substitute for a real LLM experiment.",
         "",
         "`single` keeps one shared history. `independent` keeps three isolated island histories. "
-        "`cooperative` exchanges a training winner around a simultaneous ring every two rounds "
-        "while retaining local candidates. SPT and MWR are fixed non-model baselines; random "
-        "weight search uses the configured comparable candidate budget.",
+        f"`cooperative` exchanges a training winner around a simultaneous ring every {exchange_interval} "
+        "round(s) while retaining local candidates (rounds with a recorded exchange: "
+        f"{', '.join(map(str, exchange_rounds)) or 'none'}). "
+        "SPT and MWR are fixed non-model baselines in the searched space; `pruned_*` SPT and MWR "
+        "match JobShopLib's built-in rules. Random weight search uses the configured comparable "
+        "candidate budget.",
         "",
         "## Files and sources",
         "",

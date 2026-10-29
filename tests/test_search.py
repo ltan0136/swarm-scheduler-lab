@@ -13,7 +13,7 @@ from swarm_scheduler_lab import backends, search
 from swarm_scheduler_lab.backends import Generation, OpenAICompatibleBackend, make_prompt, parse_candidate
 from swarm_scheduler_lab.budget import BudgetExceeded, BudgetLedger
 from swarm_scheduler_lab.instances import make_datasets
-from swarm_scheduler_lab.policy import initial_policies
+from swarm_scheduler_lab.policy import Policy, initial_policies
 from swarm_scheduler_lab.search import exchange_ring, run_search
 
 
@@ -126,15 +126,89 @@ def test_ring_exchange_is_simultaneous_and_retains_local_candidates():
 
 
 def test_same_initial_resources_no_exchange_for_independent(train):
-    results = [run_search(method, train, seed=7, max_calls=6, max_evaluations=9)
+    results = [run_search(method, train, seed=7, max_calls=9, max_evaluations=12)
                for method in ("single", "independent", "cooperative", "random_search")]
     initial = [[row["policy"] for row in result["history"][:3]] for result in results]
     assert all(policies == initial[0] for policies in initial)
-    assert all(result["resources"]["evaluations"] == 9 for result in results)
-    assert [result["resources"]["calls"] for result in results] == [6, 6, 6, 0]
+    assert all(result["resources"]["evaluations"] == 12 for result in results)
+    assert [result["resources"]["calls"] for result in results] == [9, 9, 9, 0]
     assert results[1]["exchanges"] == []
-    assert len(results[2]["exchanges"]) == 3
+    assert [event["round"] for event in results[2]["exchanges"]] == [2, 2, 2]
     assert all(result["resources"]["validity_rate"] == 1 for result in results)
+
+
+def test_ring_interval_and_invalid_interval():
+    islands = [[{"evaluation": i + 1, "policy": policy.to_dict(), "train_mean": 100 + i}]
+               for i, policy in enumerate(initial_policies(1))]
+    assert len(exchange_ring(islands, 3, interval=3)) == 3
+    assert exchange_ring(islands, 2, interval=3) == []
+    with pytest.raises(ValueError):
+        exchange_ring(islands, 1, interval=0)
+
+
+@pytest.mark.parametrize(("interval", "rounds"), [(1, [1, 1, 1, 2, 2, 2, 3, 3, 3]), (2, [2, 2, 2]), (4, [])])
+def test_no_migration_after_the_final_generation_round(train, interval, rounds):
+    # 12 calls over three islands are four rounds; round 4 is never followed by a proposal.
+    result = run_search("cooperative", train, seed=5, max_calls=12, max_evaluations=15,
+                        exchange_interval=interval)
+    assert [event["round"] for event in result["exchanges"]] == rounds
+    last_round = max(attempt["round"] for attempt in result["attempts"])
+    assert last_round == 4
+    assert all(event["round"] < last_round for event in result["exchanges"])
+
+
+def test_no_migration_once_evaluation_budget_is_exhausted(train):
+    # Four rounds of calls are allowed, but evaluations run out after round 2.
+    result = run_search("cooperative", train, seed=5, max_calls=12, max_evaluations=9,
+                        exchange_interval=1)
+    assert [event["round"] for event in result["exchanges"]] == [1, 1, 1]
+    assert result["resources"]["evaluations"] == 9
+
+
+def test_call_budget_is_not_capped_at_twelve(train):
+    result = run_search("independent", train, seed=2, max_calls=24, max_evaluations=27)
+    assert result["resources"]["calls"] == 24
+    assert [sum(a["island"] == i for a in result["attempts"]) for i in range(3)] == [8, 8, 8]
+
+
+def test_pruned_search_space_stays_pruned(train):
+    for method in ("single", "cooperative", "random_search", "shortest_processing_time"):
+        result = run_search(method, train, seed=4, max_calls=6, max_evaluations=9,
+                            candidate_filter="pruned")
+        assert {row["policy"]["candidate_filter"] for row in result["history"]} == {"pruned"}
+        assert result["best_policy"]["candidate_filter"] == "pruned"
+
+
+def test_pruned_baselines_ignore_configured_search_space(train):
+    for method in ("pruned_shortest_processing_time", "pruned_most_work_remaining"):
+        result = run_search(method, train, seed=4, candidate_filter="none")
+        assert result["best_policy"]["candidate_filter"] == "pruned"
+        assert result["resources"]["calls"] == 0 and result["resources"]["evaluations"] == 1
+    with pytest.raises(ValueError):
+        run_search("single", train, seed=4, candidate_filter="dominated")
+
+
+def test_default_filter_keeps_unpruned_search_reproducible(train):
+    # Policies saved before candidate_filter existed load as the unpruned space.
+    legacy = {"weights": initial_policies(0)[0].weights, "tie_break": "job_id"}
+    assert Policy.from_dict(legacy).candidate_filter == "none"
+    explicit = run_search("cooperative", train, seed=8, candidate_filter="none")
+    implicit = run_search("cooperative", train, seed=8)
+    assert explicit["history"] == implicit["history"]
+
+
+def test_candidate_filter_is_fixed_for_generated_proposals():
+    spt = initial_policies(0)[0].to_dict()
+    del spt["candidate_filter"]
+    assert parse_candidate(json.dumps(spt), "pruned").candidate_filter == "pruned"
+    assert parse_candidate(json.dumps(spt)).candidate_filter == "none"
+    with pytest.raises(ValueError):
+        parse_candidate(json.dumps({**spt, "candidate_filter": "none"}), "pruned")
+    with pytest.raises(ValueError):
+        parse_candidate("[]", "pruned")
+    prompt = make_prompt([{"policy": initial_policies(0, "pruned")[0].to_dict(), "train_mean": 1.0}],
+                         "A", "pruned")
+    assert '"candidate_filter":"pruned"' in prompt and "fixed at pruned" in prompt
 
 
 def test_fixed_seed_mock_reproduces_candidates_and_scores(train):

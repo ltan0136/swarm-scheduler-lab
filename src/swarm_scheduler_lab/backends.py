@@ -18,6 +18,10 @@ WEIGHT_NAMES = (
     "processing_time", "remaining_work", "remaining_operations",
     "earliest_start", "machine_load",
 )
+READY_SET_DESCRIPTIONS = {
+    "none": "every job's next unscheduled operation is ready, even if it cannot start yet",
+    "pruned": "only non-dominated operations that can start at the earliest possible time are ready",
+}
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -39,7 +43,7 @@ class Generation:
     token_source: str
 
 
-def make_prompt(history: list[dict], direction: str) -> str:
+def make_prompt(history: list[dict], direction: str, candidate_filter: str = "none") -> str:
     """Only callers' training evaluations enter model context.
 
     Keep a compact best-plus-recent view so the input reservation is bounded.
@@ -61,10 +65,12 @@ def make_prompt(history: list[dict], direction: str) -> str:
         "Minimize training mean makespan. Propose ONE JSON object only: "
         '{"weights":{"processing_time":0,"remaining_work":0,'
         '"remaining_operations":0,"earliest_start":0,"machine_load":0},'
-        '"tie_break":"job_id"}. '
+        f'"tie_break":"job_id","candidate_filter":"{candidate_filter}"}}. '
         "Each finite weight must be in [-10,10]. Lower weighted sum has "
         "priority. Each feature is divided by its maximum over currently ready "
         "operations (zero if that maximum is zero). "
+        f"candidate_filter is fixed at {candidate_filter} for this experiment: "
+        f"{READY_SET_DESCRIPTIONS[candidate_filter]}. "
         "Ties allowed: job_id, shortest_processing_time, most_work_remaining. "
         f"Search direction: {direction}. "
         f"Feature order: {','.join(WEIGHT_NAMES)}. "
@@ -84,14 +90,17 @@ class MockBackend:
     def generate(self, prompt: str, history: list[dict], max_output_tokens: int) -> Generation:
         # The seed, own/migrated history, and ordered calls determine every result.
         parent = min(history, key=lambda row: row["train_mean"])["policy"]
+        # The history's filter is the experiment's fixed search space.
+        candidate_filter = parent.get("candidate_filter", "none")
         if self.rng.random() < 0.25:
-            candidate = random_policy(self.rng).to_dict()
+            candidate = random_policy(self.rng, candidate_filter).to_dict()
         else:
             weights = {
                 key: round(max(-10.0, min(10.0, value + self.rng.gauss(0, 1.2))), 6)
                 for key, value in parent["weights"].items()
             }
-            candidate = {"weights": weights, "tie_break": parent["tie_break"]}
+            candidate = {"weights": weights, "tie_break": parent["tie_break"],
+                         "candidate_filter": candidate_filter}
         content = json.dumps(candidate, sort_keys=True, separators=(",", ":"))
         # Truncation is a failed proposal, exactly as a real output limit can be.
         estimated_output = math.ceil(len(content.encode("utf-8")) / 4)
@@ -176,10 +185,18 @@ class OpenAICompatibleBackend:
         return Generation(content, count("prompt_tokens"), count("completion_tokens"), self.token_source)
 
 
-def parse_candidate(content: str) -> Policy:
-    """Reject markdown, nonstandard JSON numbers, and schema violations."""
+def parse_candidate(content: str, candidate_filter: str | None = None) -> Policy:
+    """Reject markdown, nonstandard JSON numbers, and schema violations.
+
+    With ``candidate_filter``, an omitted filter takes the experiment's fixed
+    value and a different one is rejected, never silently rewritten.
+    """
     def reject_constant(value: str):
         raise ValueError(f"Non-finite JSON numeric constant: {value}")
 
     data = json.loads(content, parse_constant=reject_constant)
+    if candidate_filter is not None and isinstance(data, dict):
+        data.setdefault("candidate_filter", candidate_filter)
+        if data["candidate_filter"] != candidate_filter:
+            raise ValueError("candidate_filter is fixed by the experiment")
     return Policy.from_dict(data)

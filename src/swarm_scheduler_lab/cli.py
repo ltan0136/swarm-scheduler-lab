@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 from .experiment import METHODS, ExperimentConfig, run_experiment, save_results
+from .policy import CANDIDATE_FILTERS
 from .reporting import generate_report
 
 
@@ -25,8 +26,11 @@ def _parser() -> argparse.ArgumentParser:
     for name, default in (("data-seed", 2026), ("train-count", 8), ("test-count", 8),
                           ("jobs", 6), ("machines", 6), ("duration-max", 20),
                           ("max-calls", 12), ("max-tokens", 24000), ("max-output-tokens", 512),
-                          ("max-evaluations", 15), ("workers", 1), ("max-retries", 0)):
+                          ("max-evaluations", 15), ("workers", 1), ("max-retries", 0),
+                          ("exchange-interval", 2)):
         run.add_argument(f"--{name}", type=int, default=default)
+    run.add_argument("--candidate-filter", choices=CANDIDATE_FILTERS, default="none",
+                     help="ready-operation set ranked by searched policies (pruned_* baselines always prune)")
     run.add_argument("--solver-time-limit", type=float, default=2.0)
     run.add_argument("--timeout", type=float, default=60.0)
     run.add_argument("--model", default=os.environ.get("SWARM_MODEL"))
