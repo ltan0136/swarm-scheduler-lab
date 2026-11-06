@@ -101,10 +101,11 @@ def test_offline_smoke_entrypoint_produces_valid_raw_data_and_images(tmp_path):
     assert "MOCK" in process.stdout
     result = json.loads((tmp_path / "results.json").read_text())
     assert result["metadata"]["real_model_run"] is False
-    assert result["resources"]["generation_calls"] <= 18
+    # Four model methods (three agent organizations + history-free sampling) x 6 calls.
+    assert result["resources"]["generation_calls"] <= 24
     for run in result["runs"]:
         instances = {i["name"]: Instance.from_dict(i) for split in run["datasets"].values() for i in split}
-        assert len(run["methods"]) == 8
+        assert len(run["methods"]) == 10
         for method in run["methods"]:
             assert method["history"]
             for row in method["final"]:

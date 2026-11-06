@@ -10,21 +10,32 @@ import time
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import nullcontext
 
-from .backends import MockBackend, OpenAICompatibleBackend, make_prompt, parse_candidate
+import numpy as np
+
+from .backends import MockBackend, OpenAICompatibleBackend, make_prompt, make_sampling_prompt, parse_candidate
 from .budget import BudgetExceeded, BudgetLedger
+from .cmaes import CMAES
 from .instances import Instance
-from .policy import CANDIDATE_FILTERS, Policy, initial_policies, random_policy
+from .policy import CANDIDATE_FILTERS, FEATURES, Policy, initial_policies, random_policy
 from .scheduling import dispatch, validate
 
 
 # pruned_* baselines always use JobShopLib's default candidate pruning, so a
 # textbook rule stays visible whatever search space the experiment configures.
 METHODS = (
-    "single", "independent", "cooperative", "shortest_processing_time",
+    "single", "independent", "cooperative", "llm_sampling", "shortest_processing_time",
     "most_work_remaining", "pruned_shortest_processing_time",
-    "pruned_most_work_remaining", "random_search",
+    "pruned_most_work_remaining", "random_search", "cmaes_search",
 )
-AGENT_METHODS = METHODS[:3]
+# Organizations that search with their own (and migrated) feedback history.
+AGENT_METHODS = ("single", "independent", "cooperative")
+# Every method that calls the model: the agents plus history-free sampling.
+MODEL_METHODS = (*AGENT_METHODS, "llm_sampling")
+BUDGET_UNITS = ("calls", "tokens")
+# CMA-ES baseline: standard step size for a unit box, and the protocol overhead the
+# agent loop adds to every input reservation (used to see whether another call fits).
+CMAES_SIGMA = 0.3
+_INPUT_RESERVATION_OVERHEAD = 256
 DIRECTIONS = (
     "A: favor short current operations, then refine from your own feedback",
     "B: favor jobs with more remaining work, then refine from your own feedback",
@@ -77,6 +88,7 @@ def run_search(
     base_url: str | None = None, api_key_env: str = "SWARM_API_KEY",
     request_timeout: float = 60, max_retries: int = 0,
     candidate_filter: str = "none", exchange_interval: int = 2,
+    budget_unit: str = "calls",
 ) -> dict:
     """Search using only training instances; holdout/reference data are absent.
 
@@ -84,6 +96,14 @@ def run_search(
     Instance-level scheduling attempts are recorded separately. The CPU pool has
     a fixed size; calls are deliberately ordered to keep mock runs reproducible.
     Every explicit subsequent attempt, including after failure, reserves a call.
+
+    ``budget_unit="calls"`` splits ``max_calls`` evenly across islands (the
+    original protocol). ``budget_unit="tokens"`` drops the per-island split and
+    lets every model method call until the shared token reservation no longer
+    fits, so methods whose prompts differ in length are compared at equal tokens
+    (arXiv:2610.23977). ``max_calls`` and ``max_evaluations`` remain hard caps and
+    should then be set high enough that ``max_tokens`` binds; ``stop_reason``
+    records which limit ended the search.
     """
     if method not in METHODS:
         raise ValueError(f"Unknown search method: {method}")
@@ -103,6 +123,8 @@ def run_search(
         raise ValueError(f"candidate_filter must be one of {', '.join(CANDIDATE_FILTERS)}")
     if type(exchange_interval) is not int or exchange_interval < 1:
         raise ValueError("exchange_interval must be a positive integer")
+    if budget_unit not in BUDGET_UNITS:
+        raise ValueError(f"budget_unit must be one of {', '.join(BUDGET_UNITS)}")
     ledger = BudgetLedger(max_calls, max_tokens, max_evaluations)
     started = time.perf_counter()
     cpu_started = time.process_time()
@@ -118,7 +140,8 @@ def run_search(
     }
     history: list[dict] = []
     attempts: list[dict] = []
-    islands: list[list[dict]] = [[] for _ in range(1 if method == "single" else 3)]
+    single_island = method in ("single", "llm_sampling")
+    islands: list[list[dict]] = [[] for _ in range(1 if single_island else 3)]
     exchanges: list[dict] = []
     best: dict | None = None
     valid_schedules = 0
@@ -127,10 +150,14 @@ def run_search(
 
     # A separate seeded generator per island preserves its private random stream.
     generators = []
-    if method in AGENT_METHODS:
+    if method in MODEL_METHODS:
         for island_index in range(len(islands)):
             if backend == "mock":
-                generators.append(MockBackend(seed * 1009 + island_index))
+                generators.append(
+                    # Only history-free sampling needs the filter; agents read it from history.
+                    MockBackend(seed * 1009 + island_index, candidate_filter)
+                    if method == "llm_sampling" else MockBackend(seed * 1009 + island_index)
+                )
             else:
                 generators.append(OpenAICompatibleBackend(
                     model=model, base_url=base_url, api_key_env=api_key_env,
@@ -185,7 +212,7 @@ def run_search(
             # adaptive methods and random search. No privileged single-mode seed.
             for index, policy in enumerate(initial):
                 try:
-                    island_index = 0 if method == "single" else index
+                    island_index = 0 if single_island else index
                     evaluate(policy, island_index, "initial")
                 except BudgetExceeded as error:
                     stop_reason = str(error)
@@ -194,11 +221,34 @@ def run_search(
             if method == "random_search":
                 while ledger.snapshot()["evaluations"] < max_evaluations:
                     evaluate(random_policy(rng, candidate_filter), None, "random")
-            elif method in AGENT_METHODS:
+            elif method == "cmaes_search":
+                # Starts from the best shared initial candidate, searches the five
+                # weights in [-10, 10] mapped to the unit box, and keeps its tie rule.
+                valid_initial = [row for row in history if row["valid"]]
+                if valid_initial:
+                    start = min(valid_initial, key=lambda row: row["train_mean"])["policy"]
+                    mean = np.array([(start["weights"][name] + 10) / 20 for name in FEATURES])
+                    optimizer = CMAES(mean, CMAES_SIGMA, np.random.default_rng([seed, 2]))
+                    while ledger.snapshot()["evaluations"] < max_evaluations:
+                        samples = optimizer.ask()
+                        remaining = max_evaluations - ledger.snapshot()["evaluations"]
+                        values = []
+                        for x in samples[:remaining]:
+                            weights = {name: round(float(v) * 20 - 10, 6) for name, v in zip(FEATURES, x)}
+                            policy = Policy(weights, start["tie_break"], candidate_filter)
+                            row = evaluate(policy, None, "cmaes", optimizer.generation + 1)
+                            values.append(row["train_mean"])
+                        if len(values) < len(samples):
+                            break  # the budget ended inside this generation
+                        optimizer.tell(samples, values)
+            elif method in MODEL_METHODS:
                 # Quotient/remainder split never gives an island an implicit
                 # extra retry budget. Defaults are exactly 12 / (3 * 4).
                 count = len(islands)
-                quotas = [max_calls // count + (index < max_calls % count) for index in range(count)]
+                if budget_unit == "tokens":
+                    quotas = [max_calls] * count  # the shared ledger enforces the global caps
+                else:
+                    quotas = [max_calls // count + (index < max_calls % count) for index in range(count)]
                 island_calls = [0] * count
                 stop_all = False
                 for round_index in range(max(quotas, default=0)):
@@ -210,16 +260,20 @@ def run_search(
                             stop_reason = "candidate evaluation budget exhausted"
                             stop_all = True
                             break
-                        local_history = islands[island_index]
-                        direction = (
-                            "one continuous agent: combine short-operation, remaining-work, and random-weight exploration"
-                            if method == "single" else DIRECTIONS[island_index]
-                        )
-                        prompt = make_prompt(local_history, direction, candidate_filter)
+                        if method == "llm_sampling":
+                            local_history = []  # history-free: every call is an independent sample
+                            prompt = make_sampling_prompt(candidate_filter)
+                        else:
+                            local_history = islands[island_index]
+                            direction = (
+                                "one continuous agent: combine short-operation, remaining-work, and random-weight exploration"
+                                if method == "single" else DIRECTIONS[island_index]
+                            )
+                            prompt = make_prompt(local_history, direction, candidate_filter)
                         # A UTF-8 byte upper-bound plus protocol overhead is much
                         # more conservative than a chars/4 token estimate. Real
                         # providers must honor max_tokens; overruns are flagged.
-                        input_bound = len(prompt.encode("utf-8")) + 256
+                        input_bound = len(prompt.encode("utf-8")) + _INPUT_RESERVATION_OVERHEAD
                         for retry in range(max_retries + 1):
                             if island_calls[island_index] >= quota:
                                 break
@@ -272,9 +326,14 @@ def run_search(
                         break
                     # A migrant arriving after the last generation round could
                     # never influence a proposal, so it is not sent at all.
+                    snapshot = ledger.snapshot()
                     later_round = (
                         any(calls < quota for calls, quota in zip(island_calls, quotas))
-                        and ledger.snapshot()["evaluations"] < max_evaluations
+                        and snapshot["evaluations"] < max_evaluations
+                        # No further call can fit once less than one empty prompt's
+                        # reservation is left; then no migrant could be used either.
+                        and snapshot["reserved_or_charged_tokens"] + _INPUT_RESERVATION_OVERHEAD
+                        + max_output_tokens <= max_tokens
                     )
                     if method == "cooperative" and not stop_all and later_round:
                         exchanges.extend(exchange_ring(islands, round_index + 1, exchange_interval))
@@ -295,10 +354,10 @@ def run_search(
     })
     children = resource.getrusage(resource.RUSAGE_CHILDREN)
     snapshot["cpu_time"] += children.ru_utime + children.ru_stime - child_cpu_started
-    if backend == "mock" and method in AGENT_METHODS and snapshot["calls"]:
+    if backend == "mock" and method in MODEL_METHODS and snapshot["calls"]:
         snapshot["token_accounting"] = "estimated_mock"
     return {
-        "method": method, "backend": backend, "seed": seed,
+        "method": method, "backend": backend, "seed": seed, "budget_unit": budget_unit,
         "best_policy": best["policy"], "best_train_mean": best["train_mean"],
         "history": history, "attempts": attempts, "resources": snapshot,
         "exchanges": exchanges, "stop_reason": stop_reason,

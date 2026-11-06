@@ -61,6 +61,29 @@ def make_prompt(history: list[dict], direction: str, candidate_filter: str = "no
         for row in selected
     ]
     return (
+        _rule_description(candidate_filter)
+        + f"Search direction: {direction}. "
+        f"Feature order: {','.join(WEIGHT_NAMES)}. "
+        "Only training feedback follows; no evaluation-set feedback is available: "
+        + json.dumps(feedback, separators=(",", ":"), allow_nan=False)
+    )
+
+
+def make_sampling_prompt(candidate_filter: str = "none") -> str:
+    """The same rule description with no feedback: one independent sample per call.
+
+    This is the history-free ablation that evolutionary LLM search is usually
+    compared against; it carries no candidates, so each call is much cheaper.
+    """
+    return (
+        _rule_description(candidate_filter)
+        + f"Feature order: {','.join(WEIGHT_NAMES)}. "
+        "No feedback is provided: propose one promising rule from this description alone."
+    )
+
+
+def _rule_description(candidate_filter: str) -> str:
+    return (
         "Search a restricted dispatching rule for job-shop scheduling. "
         "Minimize training mean makespan. Propose ONE JSON object only: "
         '{"weights":{"processing_time":0,"remaining_work":0,'
@@ -72,10 +95,6 @@ def make_prompt(history: list[dict], direction: str, candidate_filter: str = "no
         f"candidate_filter is fixed at {candidate_filter} for this experiment: "
         f"{READY_SET_DESCRIPTIONS[candidate_filter]}. "
         "Ties allowed: job_id, shortest_processing_time, most_work_remaining. "
-        f"Search direction: {direction}. "
-        f"Feature order: {','.join(WEIGHT_NAMES)}. "
-        "Only training feedback follows; no evaluation-set feedback is available: "
-        + json.dumps(feedback, separators=(",", ":"), allow_nan=False)
     )
 
 
@@ -84,11 +103,16 @@ class MockBackend:
 
     token_source = "estimated_mock"
 
-    def __init__(self, seed: int):
+    def __init__(self, seed: int, candidate_filter: str = "none"):
         self.rng = random.Random(seed)
+        self.candidate_filter = candidate_filter
 
     def generate(self, prompt: str, history: list[dict], max_output_tokens: int) -> Generation:
         # The seed, own/migrated history, and ordered calls determine every result.
+        if not history:
+            # History-free sampling: a draw from the prior, i.e. a random rule.
+            candidate = random_policy(self.rng, self.candidate_filter).to_dict()
+            return self._generation(candidate, prompt, max_output_tokens)
         parent = min(history, key=lambda row: row["train_mean"])["policy"]
         # The history's filter is the experiment's fixed search space.
         candidate_filter = parent.get("candidate_filter", "none")
@@ -101,6 +125,9 @@ class MockBackend:
             }
             candidate = {"weights": weights, "tie_break": parent["tie_break"],
                          "candidate_filter": candidate_filter}
+        return self._generation(candidate, prompt, max_output_tokens)
+
+    def _generation(self, candidate: dict, prompt: str, max_output_tokens: int) -> Generation:
         content = json.dumps(candidate, sort_keys=True, separators=(",", ":"))
         # Truncation is a failed proposal, exactly as a real output limit can be.
         estimated_output = math.ceil(len(content.encode("utf-8")) / 4)

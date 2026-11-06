@@ -31,6 +31,9 @@ def _parser() -> argparse.ArgumentParser:
         run.add_argument(f"--{name}", type=int, default=default)
     run.add_argument("--candidate-filter", choices=CANDIDATE_FILTERS, default="none",
                      help="ready-operation set ranked by searched policies (pruned_* baselines always prune)")
+    run.add_argument("--budget-unit", choices=("calls", "tokens"), default="calls",
+                     help="calls: split --max-calls across islands; tokens: call until --max-tokens "
+                          "binds (raise --max-calls/--max-evaluations so they do not)")
     run.add_argument("--solver-time-limit", type=float, default=2.0)
     run.add_argument("--timeout", type=float, default=60.0)
     run.add_argument("--model", default=os.environ.get("SWARM_MODEL"))

@@ -393,3 +393,87 @@ def test_real_redirect_is_rejected_without_forwarding_authorization(monkeypatch)
             server.server_close()
         for thread in threads:
             thread.join(timeout=2)
+
+
+def test_cmaes_baseline_uses_the_evaluation_budget_and_no_model(train):
+    result = run_search("cmaes_search", train, seed=7, max_calls=9, max_evaluations=14)
+    assert result["resources"]["calls"] == 0
+    assert result["resources"]["evaluations"] == 14
+    sources = [row["source"] for row in result["history"]]
+    assert sources[:3] == ["initial"] * 3 and set(sources[3:]) == {"cmaes"}
+    start = min(result["history"][:3], key=lambda row: row["train_mean"])["policy"]
+    for row in result["history"][3:]:
+        assert row["policy"]["tie_break"] == start["tie_break"]
+        assert all(-10 <= value <= 10 for value in row["policy"]["weights"].values())
+    again = run_search("cmaes_search", train, seed=7, max_calls=9, max_evaluations=14)
+    assert [r["policy"] for r in again["history"]] == [r["policy"] for r in result["history"]]
+    assert result["best_train_mean"] <= min(row["train_mean"] for row in result["history"][:3])
+
+
+def test_cmaes_optimizer_converges_on_a_smooth_objective():
+    import numpy as np
+
+    from swarm_scheduler_lab.cmaes import CMAES
+
+    target = np.array([0.1, 0.8, 0.3, 0.6, 0.9])
+    optimizer = CMAES(np.full(5, 0.5), 0.3, np.random.default_rng(0))
+    for _ in range(80):
+        xs = optimizer.ask()
+        assert ((xs >= 0) & (xs <= 1)).all()
+        optimizer.tell(xs, [float(np.sum((x - target) ** 2)) for x in xs])
+    assert np.linalg.norm(optimizer.mean - target) < 0.02
+    before = optimizer.mean.copy()
+    optimizer.tell(optimizer.ask(), [None] * optimizer.population)  # all invalid: no update
+    assert np.array_equal(optimizer.mean, before)
+
+
+def test_llm_sampling_sends_no_feedback_and_shares_the_call_budget(train, monkeypatch):
+    seen = []
+
+    class RecordingBackend(backends.MockBackend):
+        def generate(self, prompt, history, limit):
+            seen.append((prompt, list(history)))
+            return super().generate(prompt, history, limit)
+
+    monkeypatch.setattr(search, "MockBackend", RecordingBackend)
+    result = run_search("llm_sampling", train, seed=5, max_calls=6, max_evaluations=9)
+    assert result["resources"]["calls"] == 6
+    assert result["resources"]["evaluations"] == 9
+    assert result["islands"] == [] and result["exchanges"] == []
+    assert all(history == [] and "training_mean_makespan" not in prompt for prompt, history in seen)
+    assert len({prompt for prompt, _ in seen}) == 1
+    assert result["resources"]["token_accounting"] == "estimated_mock"
+    assert {row["source"] for row in result["history"][3:]} == {"generated"}
+
+
+def test_history_free_prompt_is_cheaper_than_an_evolution_prompt(train):
+    sampling = run_search("llm_sampling", train, seed=5, max_calls=6, max_evaluations=9)
+    single = run_search("single", train, seed=5, max_calls=6, max_evaluations=9)
+    per_call = lambda r: r["resources"]["input_tokens"] / r["resources"]["calls"]
+    assert per_call(sampling) < per_call(single)
+
+
+def test_token_budget_unit_lets_cheaper_calls_buy_more_attempts(train):
+    common = dict(seed=5, max_calls=200, max_evaluations=203, max_tokens=12000, max_output_tokens=64)
+    sampling = run_search("llm_sampling", train, budget_unit="tokens", **common)
+    single = run_search("single", train, budget_unit="tokens", **common)
+    for result in (sampling, single):
+        assert result["budget_unit"] == "tokens"
+        assert "token" in result["stop_reason"]
+        assert result["resources"]["reserved_or_charged_tokens"] <= 12000
+    assert sampling["resources"]["calls"] > single["resources"]["calls"]
+    # calls mode keeps the original per-island split
+    calls = run_search("independent", train, seed=5, max_calls=7, max_evaluations=20)
+    assert calls["budget_unit"] == "calls" and calls["resources"]["calls"] == 7
+    with pytest.raises(ValueError, match="budget_unit"):
+        run_search("single", train, seed=5, budget_unit="dollars")
+
+
+def test_token_budget_unit_lets_islands_share_one_token_pool(train):
+    result = run_search("independent", train, seed=5, budget_unit="tokens", max_calls=200,
+                        max_evaluations=203, max_tokens=9000, max_output_tokens=64)
+    per_island = [0, 0, 0]
+    for attempt in result["attempts"]:
+        per_island[attempt["island"]] += 1
+    assert max(per_island) - min(per_island) <= 1  # round-robin until the shared pool runs out
+    assert "token" in result["stop_reason"]

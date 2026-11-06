@@ -359,17 +359,25 @@ def _markdown(result: dict, rows: list[dict], has_tokens: bool, has_gantt: bool)
         "budget control, not measured provider consumption. Complete resource records are in "
         "`results.json` and `summary.csv` (repeated per split for convenience).",
         "",
+        f"Budget unit: `{result['config'].get('budget_unit', 'calls')}`. A call is not a fixed amount "
+        "of compute: prompts that carry feedback history cost more per call than history-free "
+        "`llm_sampling`, so equal-call comparisons give some methods more tokens "
+        "(arXiv:2610.23977). Compare `Tokens / call`, or rerun with `--budget-unit tokens`.",
+        "",
         "| Seed | Method | Calls | Failures | Candidate evaluations | Input tokens | Output tokens "
-        "| Unknown-usage calls | Wall seconds | CPU seconds | Token accounting |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| Tokens / call | Unknown-usage calls | Wall seconds | CPU seconds | Token accounting |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for run in result.get("runs", []):
         for method in run.get("methods", []):
             r = method.get("resources", {})
+            known = r.get("calls") and r.get("input_tokens") is not None and r.get("output_tokens") is not None
+            per_call = (r["input_tokens"] + r["output_tokens"]) / r["calls"] if known else None
             lines.append(
                 f"| {run['seed']} | {method['method']} | {_number(r.get('calls'))} | "
                 f"{_number(r.get('failures'))} | {_number(r.get('evaluations'))} | "
                 f"{_number(r.get('input_tokens'))} | {_number(r.get('output_tokens'))} | "
+                f"{_number(per_call) if r.get('calls') else 'n/a'} | "
                 f"{_number(r.get('unknown_usage_calls'))} | {_number(r.get('wall_time'))} | "
                 f"{_number(r.get('cpu_time'))} | {_number(r.get('token_accounting'))} |"
             )
