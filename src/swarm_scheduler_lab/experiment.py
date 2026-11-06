@@ -18,7 +18,7 @@ from urllib.parse import urlsplit
 from .instances import make_datasets
 from .policy import CANDIDATE_FILTERS, Policy
 from .scheduling import InvalidSchedule, dispatch, validate
-from .search import AGENT_METHODS, METHODS, run_search
+from .search import BUDGET_UNITS, METHODS, MODEL_METHODS, run_search
 from .solver import solve_reference
 
 
@@ -43,6 +43,7 @@ class ExperimentConfig:
     max_retries: int = 0
     candidate_filter: str = "none"
     exchange_interval: int = 2
+    budget_unit: str = "calls"
     model: str | None = None
     base_url: str | None = None
     api_key_env: str = "SWARM_API_KEY"
@@ -63,6 +64,8 @@ class ExperimentConfig:
         # No fixed ceiling: max_calls and max_tokens are the explicit hard limits.
         if self.max_calls < 0:
             raise ValueError("max_calls must be nonnegative")
+        if self.budget_unit not in BUDGET_UNITS:
+            raise ValueError(f"budget_unit must be one of {', '.join(BUDGET_UNITS)}")
         if self.candidate_filter not in CANDIDATE_FILTERS:
             raise ValueError(f"candidate_filter must be one of {', '.join(CANDIDATE_FILTERS)}")
         if self.max_evaluations < 3:
@@ -71,7 +74,7 @@ class ExperimentConfig:
             raise ValueError("max_retries must be nonnegative; every retry consumes a call")
         if any(not math.isfinite(v) or v <= 0 for v in (self.solver_time_limit, self.timeout)):
             raise ValueError("solver time limit and request timeout must be finite and positive")
-        if self.backend == "real" and any(m in AGENT_METHODS for m in self.methods):
+        if self.backend == "real" and any(m in MODEL_METHODS for m in self.methods):
             if not self.model:
                 raise ValueError("real backend requires --model or SWARM_MODEL")
             if not os.environ.get(self.api_key_env):
@@ -140,7 +143,7 @@ def run_experiment(config: ExperimentConfig) -> dict:
             **_source_provenance(),
             "dataset_sha256": dataset_hash,
             "experiment_kind": "MOCK_FUNCTIONAL_DEMONSTRATION" if config.backend == "mock" else "REAL_MODEL_EXPERIMENT",
-            "real_model_run": config.backend == "real" and any(m in AGENT_METHODS for m in config.methods),
+            "real_model_run": config.backend == "real" and any(m in MODEL_METHODS for m in config.methods),
             "selection_metric": "mean training makespan (lower is better)",
             "evaluation_unit": "one candidate policy on all training instances",
             "holdout_protocol": "all winners frozen using training feedback before final holdout evaluation",
@@ -166,6 +169,7 @@ def run_experiment(config: ExperimentConfig) -> dict:
                 request_timeout=config.timeout, max_retries=config.max_retries,
                 candidate_filter=config.candidate_filter,
                 exchange_interval=config.exchange_interval,
+                budget_unit=config.budget_unit,
             ))
         result["runs"].append({"seed": seed, "datasets": dataset_json, "methods": methods})
 
