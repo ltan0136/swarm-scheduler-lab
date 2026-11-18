@@ -18,6 +18,7 @@ from urllib.parse import urlsplit
 from .instances import make_datasets
 from .policy import CANDIDATE_FILTERS, Policy
 from .scheduling import InvalidSchedule, dispatch, validate
+from .run_files import SearchJournal, write_json
 from .search import BUDGET_UNITS, METHODS, MODEL_METHODS, run_search
 from .solver import solve_reference
 
@@ -48,7 +49,7 @@ class ExperimentConfig:
     base_url: str | None = None
     api_key_env: str = "SWARM_API_KEY"
 
-    def validate(self) -> None:
+    def validate(self, *, check_credentials: bool = True) -> None:
         if self.backend not in ("mock", "real"):
             raise ValueError("backend must be mock or real")
         if not self.methods or any(m not in METHODS for m in self.methods):
@@ -77,7 +78,7 @@ class ExperimentConfig:
         if self.backend == "real" and any(m in MODEL_METHODS for m in self.methods):
             if not self.model:
                 raise ValueError("real backend requires --model or SWARM_MODEL")
-            if not os.environ.get(self.api_key_env):
+            if check_credentials and not os.environ.get(self.api_key_env):
                 raise ValueError(f"real backend requires the {self.api_key_env} environment variable")
         if self.base_url:
             parsed = urlsplit(self.base_url)
@@ -115,14 +116,14 @@ def _source_provenance() -> dict:
     return {"git_worktree_dirty": dirty, "source_tree_sha256": digest.hexdigest()}
 
 
-def run_experiment(config: ExperimentConfig) -> dict:
+def run_experiment(config: ExperimentConfig, *, output_dir: Path | None = None, resume: bool = False) -> dict:
     """Search sees *only* train; references and final evaluations run afterward.
 
     One evaluation is one policy evaluated on every training instance. All
     schedules (training, holdout, benchmark, solver) pass the independent checker.
     Data are fixed across search seeds to allow paired method comparisons.
     """
-    config.validate()
+    config.validate(check_credentials=not resume)
     started, cpu_started = time.perf_counter(), time.process_time()
     children = resource.getrusage(resource.RUSAGE_CHILDREN)
     child_cpu_started = children.ru_utime + children.ru_stime
@@ -138,7 +139,7 @@ def run_experiment(config: ExperimentConfig) -> dict:
         "metadata": {
             "python": platform.python_version(),
             "dependencies": {p: importlib.metadata.version(p) for p in
-                             ("job-shop-lib", "ortools", "matplotlib", "jsonschema")},
+                             ("job-shop-lib", "ortools", "matplotlib", "jsonschema", "numpy")},
             "git_revision": _revision(),
             **_source_provenance(),
             "dataset_sha256": dataset_hash,
@@ -155,12 +156,28 @@ def run_experiment(config: ExperimentConfig) -> dict:
         },
         "runs": [],
     }
+    journal = None
+    previous = {}
+    if output_dir is not None:
+        journal = SearchJournal.start(output_dir, result["config"], result["metadata"], resume=resume)
+        if resume:
+            for seed in config.seeds:
+                for method in config.methods:
+                    saved = journal.completed(seed, method)
+                    if saved is not None:
+                        previous[seed, method] = saved
+    if resume and any((seed, method) not in previous for seed in config.seeds
+                      for method in config.methods if method in MODEL_METHODS):
+        config.validate()
     # Complete every search before any holdout schedule or solver reference is
     # computed. Neither references nor benchmark optimum can enter an agent.
     for seed in config.seeds:
         methods = []
         for method in config.methods:
-            methods.append(run_search(
+            if (seed, method) in previous:
+                methods.append(previous[seed, method])
+                continue
+            search = run_search(
                 method, datasets["train"], seed=seed, backend=config.backend,
                 max_calls=config.max_calls, max_tokens=config.max_tokens,
                 max_output_tokens=config.max_output_tokens,
@@ -170,7 +187,10 @@ def run_experiment(config: ExperimentConfig) -> dict:
                 candidate_filter=config.candidate_filter,
                 exchange_interval=config.exchange_interval,
                 budget_unit=config.budget_unit,
-            ))
+            )
+            if journal is not None:
+                journal.record(search)
+            methods.append(search)
         result["runs"].append({"seed": seed, "datasets": dataset_json, "methods": methods})
 
     reference_started, reference_cpu = time.perf_counter(), time.process_time()
@@ -212,13 +232,17 @@ def run_experiment(config: ExperimentConfig) -> dict:
         "cpu_time": time.process_time() - cpu_started + children.ru_utime + children.ru_stime - child_cpu_started,
         "generation_calls": sum(m["resources"]["calls"] for r in result["runs"] for m in r["methods"]),
     }
+    if resume:
+        # Active time from the current process plus completed searches from older attempts.
+        # Time spent inside an interrupted search is not recoverable from a finished unit.
+        for key in ("wall_time", "cpu_time"):
+            result["resources"][key] += sum(unit["resources"][key] for unit in previous.values())
+        result["resources"]["resumed_searches"] = len(previous)
     return result
 
 
 def save_results(result: dict, output_dir: Path) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     destination = output_dir / "results.json"
-    temporary = output_dir / ".results.json.tmp"
-    temporary.write_text(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
-    temporary.replace(destination)
+    write_json(destination, result)
     return destination
